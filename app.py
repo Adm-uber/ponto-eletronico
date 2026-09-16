@@ -7,7 +7,7 @@ import base64
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 st.title("⏱️ Sistema de Fechamento de Ponto")
-st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto e da planilha de cadastro de colaboradores.")
+st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto para processar as batidas.")
 
 # --- Função de Decodificação ---
 def decodificar_id(valor):
@@ -31,58 +31,7 @@ def decodificar_id(valor):
     return valor_clean
 
 # --- Processamento ---
-def processar_arquivos(uploaded_txt, uploaded_excel):
-    # 1. Ler Tabela de Colaboradores e Montar Dicionário Expandido
-    mapa_colab = {}
-    
-    if uploaded_excel is not None:
-        try:
-            if uploaded_excel.name.endswith('.csv'):
-                df_colab = pd.read_csv(uploaded_excel)
-            else:
-                df_colab = pd.read_excel(uploaded_excel)
-            
-            col_nome = None
-            cols_identificadores = []
-            
-            # Identifica colunas relevantes
-            for col in df_colab.columns:
-                c_str = str(col).strip().lower()
-                if any(k in c_str for k in ["colaborador", "nome", "funcionario"]):
-                    col_nome = col
-                elif any(k in c_str for k in ["pis", "cpf", "doc", "cód", "cod", "id", "matricula", "cracha", "crachá"]):
-                    cols_identificadores.append(col)
-            
-            if col_nome:
-                for _, row in df_colab.iterrows():
-                    nome = str(row[col_nome]).strip()
-                    if not nome or nome.lower() == "nan":
-                        continue
-                    
-                    # Mapeia cada coluna identificadora (PIS, CPF, Matrícula, Crachá, etc.)
-                    for col_id in cols_identificadores:
-                        val_raw = str(row[col_id]).strip()
-                        if val_raw and val_raw.lower() != "nan":
-                            doc_digitos = re.sub(r'\D', '', val_raw)
-                            
-                            # Chaves exatas e com tratamento de zeros
-                            mapa_colab[val_raw] = nome
-                            if doc_digitos:
-                                mapa_colab[doc_digitos] = nome
-                                mapa_colab[doc_digitos.lstrip('0')] = nome
-                                mapa_colab[doc_digitos.zfill(11)] = nome
-                                mapa_colab[doc_digitos.zfill(12)] = nome
-                                
-                            # Mapeia versão codificada em Base64 para garantir match
-                            try:
-                                b64_val = base64.b64encode(val_raw.encode('utf-8')).decode('utf-8')
-                                mapa_colab[b64_val] = nome
-                            except Exception:
-                                pass
-        except Exception as e:
-            st.sidebar.error(f"Erro ao ler cadastro de colaboradores: {e}")
-
-    # 2. Ler Arquivo TXT do Relógio
+def processar_arquivo_txt(uploaded_txt):
     linhas = uploaded_txt.getvalue().decode("utf-8", errors="ignore").splitlines()
     registros = []
 
@@ -96,9 +45,9 @@ def processar_arquivos(uploaded_txt, uploaded_excel):
             try:
                 data_raw = linha[10:18]   # DDMMAAAA
                 hora_raw = linha[18:22]   # HHMM
-                doc_raw = linha[22:].strip() # PIS / CPF / Crachá
+                doc_raw = linha[22:].strip() # PIS / CPF / Crachá / ID
                 
-                # Decodifica caso venha codificado ou extrai dígitos
+                # Decodifica caso venha codificado em Base64 ou extrai dígitos
                 doc_decodificado = decodificar_id(doc_raw)
                 numeros_doc = re.findall(r'\d+', doc_decodificado)
                 doc_limpo = numeros_doc[0] if numeros_doc else doc_decodificado
@@ -107,26 +56,12 @@ def processar_arquivos(uploaded_txt, uploaded_excel):
                 data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}" if len(data_raw) == 8 and data_raw.isdigit() else "Data Invalida"
                 hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}" if len(hora_raw) == 4 and hora_raw.isdigit() else "Hora Invalida"
                 
-                # Busca Nome pelo documento/código decodificado
-                nome_colaborador = "Desconhecido"
-                
-                # Busca direta ou comparativa no mapa
-                if doc_raw in mapa_colab:
-                    nome_colaborador = mapa_colab[doc_raw]
-                elif doc_limpo in mapa_colab:
-                    nome_colaborador = mapa_colab[doc_limpo]
-                else:
-                    for k_doc, v_nome in mapa_colab.items():
-                        if k_doc and (k_doc in doc_limpo or doc_limpo in k_doc or k_doc.lstrip('0') == doc_limpo.lstrip('0')):
-                            nome_colaborador = v_nome
-                            break
-                
-                if nome_colaborador == "Desconhecido" and doc_limpo:
-                    nome_colaborador = f"ID/PIS: {doc_limpo}"
+                # Identificador obtido diretamente do arquivo
+                colaborador_id = f"Colaborador {doc_limpo}" if doc_limpo else "Desconhecido"
 
                 registros.append({
-                    "Colaborador": nome_colaborador,
-                    "PIS/CPF": doc_limpo,
+                    "Colaborador": colaborador_id,
+                    "PIS/CPF/ID": doc_limpo,
                     "Data": data_form,
                     "Hora": hora_form,
                     "Origem": "Relógio (AFD)",
@@ -139,15 +74,14 @@ def processar_arquivos(uploaded_txt, uploaded_excel):
 
 # --- Session State ---
 if "df_ponto" not in st.session_state:
-    st.session_state.df_ponto = pd.DataFrame(columns=["Colaborador", "PIS/CPF", "Data", "Hora", "Origem", "Observação"])
+    st.session_state.df_ponto = pd.DataFrame(columns=["Colaborador", "PIS/CPF/ID", "Data", "Hora", "Origem", "Observação"])
 
 # --- Sidebar ---
 st.sidebar.header("📁 Importar Dados")
-uploaded_txt = st.sidebar.file_uploader("1. Arquivo TXT do Relógio (.txt)", type=["txt", "csv", "afd"])
-uploaded_excel = st.sidebar.file_uploader("2. Cadastro de Colaboradores (.xlsx / .csv)", type=["xlsx", "xls", "csv"])
+uploaded_txt = st.sidebar.file_uploader("Arquivo TXT do Relógio (.txt)", type=["txt", "csv", "afd"])
 
 if uploaded_txt is not None and st.sidebar.button("Processar e Fechar Ponto"):
-    df_res = processar_arquivos(uploaded_txt, uploaded_excel)
+    df_res = processar_arquivo_txt(uploaded_txt)
     if not df_res.empty:
         st.session_state.df_ponto = df_res
         st.sidebar.success(f"Sucesso! {len(df_res)} registros processados.")
@@ -185,10 +119,10 @@ if not st.session_state.df_ponto.empty:
         obs = c3.text_input("Observação / Atestado", "Ajuste Manual")
         
         if st.button("Adicionar Registro"):
-            pis_val = df_colab["PIS/CPF"].iloc[0] if not df_colab.empty else ""
+            pis_val = df_colab["PIS/CPF/ID"].iloc[0] if not df_colab.empty else ""
             novo_reg = pd.DataFrame([{
                 "Colaborador": colab_sel,
-                "PIS/CPF": pis_val,
+                "PIS/CPF/ID": pis_val,
                 "Data": nova_data.strftime("%Y-%m-%d"),
                 "Hora": nova_hora.strftime("%H:%M"),
                 "Origem": "Manual",
@@ -219,4 +153,4 @@ if not st.session_state.df_ponto.empty:
         mime="text/csv"
     )
 else:
-    st.info("Por favor, faça o upload do arquivo TXT e da planilha de colaboradores no menu lateral.")
+    st.info("Por favor, faça o upload do arquivo TXT no menu lateral para iniciar.")
