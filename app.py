@@ -2,17 +2,38 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import re
+import base64
 
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 st.title("⏱️ Sistema de Fechamento de Ponto")
 st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto e da planilha de cadastro de colaboradores.")
 
+# --- Função de Decodificação ---
+def decodificar_id(valor):
+    """
+    Tenta decodificar identificadores codificados em Base64 ou limpa caracteres.
+    """
+    if not valor or not isinstance(valor, str):
+        return ""
+    
+    valor_clean = valor.strip()
+    
+    # Tentativa de decodificação Base64 se parecer um hash
+    if len(valor_clean) % 4 == 0 and re.match(r'^[A-Za-z0-9+/=]+$', valor_clean) and not valor_clean.isdigit():
+        try:
+            dec = base64.b64decode(valor_clean).decode('utf-8', errors='ignore').strip()
+            if dec:
+                return dec
+        except Exception:
+            pass
+
+    return valor_clean
+
 # --- Processamento ---
 def processar_arquivos(uploaded_txt, uploaded_excel):
-    # 1. Ler Tabela de Colaboradores
-    mapa_pis = {}
-    mapa_cpf = {}
+    # 1. Ler Tabela de Colaboradores e Montar Dicionário Expandido
+    mapa_colab = {}
     
     if uploaded_excel is not None:
         try:
@@ -22,24 +43,42 @@ def processar_arquivos(uploaded_txt, uploaded_excel):
                 df_colab = pd.read_excel(uploaded_excel)
             
             col_nome = None
-            col_pis = None
+            cols_identificadores = []
             
+            # Identifica colunas relevantes
             for col in df_colab.columns:
                 c_str = str(col).strip().lower()
-                if "colaborador" in c_str or "nome" in c_str or "funcionario" in c_str:
+                if any(k in c_str for k in ["colaborador", "nome", "funcionario"]):
                     col_nome = col
-                elif "pis" in c_str or "cpf" in c_str or "doc" in c_str or "cód" in c_str or "cod" in c_str:
-                    col_pis = col
+                elif any(k in c_str for k in ["pis", "cpf", "doc", "cód", "cod", "id", "matricula", "cracha", "crachá"]):
+                    cols_identificadores.append(col)
             
-            if col_nome and col_pis:
+            if col_nome:
                 for _, row in df_colab.iterrows():
                     nome = str(row[col_nome]).strip()
-                    doc_raw = re.sub(r'\D', '', str(row[col_pis]))
-                    if doc_raw and nome:
-                        mapa_pis[doc_raw] = nome
-                        # Guarda variações com zeros à esquerda
-                        mapa_pis[doc_raw.zfill(11)] = nome
-                        mapa_pis[doc_raw.zfill(12)] = nome
+                    if not nome or nome.lower() == "nan":
+                        continue
+                    
+                    # Mapeia cada coluna identificadora (PIS, CPF, Matrícula, Crachá, etc.)
+                    for col_id in cols_identificadores:
+                        val_raw = str(row[col_id]).strip()
+                        if val_raw and val_raw.lower() != "nan":
+                            doc_digitos = re.sub(r'\D', '', val_raw)
+                            
+                            # Chaves exatas e com tratamento de zeros
+                            mapa_colab[val_raw] = nome
+                            if doc_digitos:
+                                mapa_colab[doc_digitos] = nome
+                                mapa_colab[doc_digitos.lstrip('0')] = nome
+                                mapa_colab[doc_digitos.zfill(11)] = nome
+                                mapa_colab[doc_digitos.zfill(12)] = nome
+                                
+                            # Mapeia versão codificada em Base64 para garantir match
+                            try:
+                                b64_val = base64.b64encode(val_raw.encode('utf-8')).decode('utf-8')
+                                mapa_colab[b64_val] = nome
+                            except Exception:
+                                pass
         except Exception as e:
             st.sidebar.error(f"Erro ao ler cadastro de colaboradores: {e}")
 
@@ -53,32 +92,37 @@ def processar_arquivos(uploaded_txt, uploaded_excel):
             continue
             
         # Padrão AFD (Registro Tipo 3 = Marcação de Ponto)
-        # Exemplo AFD: NSR(10) + Tipo(1) + Data(8) + Hora(4) + PIS(12 ou CPF)
         if len(linha) >= 30 and (linha[9:10] == "3" or "3" in linha[9:11]):
             try:
-                data_raw = linha[10:18] # DDMMAAAA
-                hora_raw = linha[18:22] # HHMM
-                doc_raw = linha[22:].strip() # PIS / CPF
+                data_raw = linha[10:18]   # DDMMAAAA
+                hora_raw = linha[18:22]   # HHMM
+                doc_raw = linha[22:].strip() # PIS / CPF / Crachá
                 
-                # Extrai apenas os dígitos numéricos do documento
-                numeros_doc = re.findall(r'\d+', doc_raw)
-                doc_limpo = numeros_doc[0] if numeros_doc else ""
+                # Decodifica caso venha codificado ou extrai dígitos
+                doc_decodificado = decodificar_id(doc_raw)
+                numeros_doc = re.findall(r'\d+', doc_decodificado)
+                doc_limpo = numeros_doc[0] if numeros_doc else doc_decodificado
                 
                 # Trata Data e Hora
                 data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}" if len(data_raw) == 8 and data_raw.isdigit() else "Data Invalida"
                 hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}" if len(hora_raw) == 4 and hora_raw.isdigit() else "Hora Invalida"
                 
-                # Busca Nome pelo PIS/CPF
+                # Busca Nome pelo documento/código decodificado
                 nome_colaborador = "Desconhecido"
                 
-                # Tenta casar documento exato ou sufixos/prefixos
-                for k_doc, v_nome in mapa_pis.items():
-                    if k_doc in doc_limpo or doc_limpo in k_doc or k_doc.lstrip('0') == doc_limpo.lstrip('0'):
-                        nome_colaborador = v_nome
-                        break
+                # Busca direta ou comparativa no mapa
+                if doc_raw in mapa_colab:
+                    nome_colaborador = mapa_colab[doc_raw]
+                elif doc_limpo in mapa_colab:
+                    nome_colaborador = mapa_colab[doc_limpo]
+                else:
+                    for k_doc, v_nome in mapa_colab.items():
+                        if k_doc and (k_doc in doc_limpo or doc_limpo in k_doc or k_doc.lstrip('0') == doc_limpo.lstrip('0')):
+                            nome_colaborador = v_nome
+                            break
                 
                 if nome_colaborador == "Desconhecido" and doc_limpo:
-                    nome_colaborador = f"PIS/CPF: {doc_limpo}"
+                    nome_colaborador = f"ID/PIS: {doc_limpo}"
 
                 registros.append({
                     "Colaborador": nome_colaborador,
