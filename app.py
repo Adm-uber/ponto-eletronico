@@ -1,46 +1,80 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import re
 
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 st.title("⏱️ Sistema de Fechamento de Ponto")
-st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto para processar e ajustar as batidas por funcionário.")
+st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto e (opcionalmente) uma planilha de cadastro de funcionários.")
 
-def processar_txt(uploaded_file):
+# --- Módulo de Processamento dos Arquivos ---
+def processar_txt(uploaded_file, df_depara=None):
     linhas = uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
     registros = []
     
+    # Criar dicionário de busca rápida para De-Para (CPF/PIS -> Nome)
+    mapa_nomes = {}
+    if df_depara is not None:
+        try:
+            # Limpa e padroniza colunas do De-Para
+            col_doc = None
+            col_nome = None
+            
+            for col in df_depara.columns:
+                col_lower = str(col).lower()
+                if any(k in col_lower for k in ["cpf", "pis", "matricula", "documento", "cód", "cod"]):
+                    col_doc = col
+                if any(k in col_lower for k in ["nome", "funcionario", "colaborador", "empregado"]):
+                    col_nome = col
+            
+            if col_doc and col_nome:
+                for _, row in df_depara.iterrows():
+                    doc_val = re.sub(r'\D', '', str(row[col_doc]))
+                    nome_val = str(row[col_nome]).strip()
+                    if doc_val and nome_val:
+                        mapa_nomes[doc_val] = nome_val
+        except Exception as e:
+            st.sidebar.warning("Não foi possível mapear a planilha de funcionários. Verifique o formato.")
+
     for linha in linhas:
         linha = linha.strip()
         if not linha:
             continue
             
-        # Padrão AFD do Relógio de Ponto (REP-C / REP-A / Portaria 671/1510)
-        # O campo '3' na posição 9 (index 9) identifica marcação de ponto
-        if len(linha) >= 34 and linha[9:10] == "3":
+        # Tratamento do Arquivo AFD / REP-C / REP-A
+        # O Registro Tipo 3 é a marcação de ponto
+        if len(linha) >= 30 and ("3" in linha[9:11] or linha.startswith("3")):
             try:
-                data_str = linha[10:18] # DDMMAAAA
-                hora_str = linha[18:22] # HHMM
-                pis = linha[22:34].strip() # PIS
+                # Busca todos os blocos numéricos da linha
+                numeros = re.findall(r'\d+', linha)
                 
-                # Validação básica de tamanho/numérico do PIS para evitar capturar fuso ou texto
-                if not pis.isdigit():
-                    # Tenta buscar CPF/PIS em posições alternativas se o arquivo for REP-C com fuso
-                    # Procurar sequência de 11 ou 12 dígitos
-                    import re
-                    digitos = re.findall(r'\d{11,12}', linha[22:])
-                    if digitos:
-                        pis = digitos[0]
+                # Identifica PIS ou CPF na linha (sequências de 11 a 12 dígitos)
+                pis_cpf = "Não Identificado"
+                for num in numeros:
+                    if len(num) in [11, 12]:
+                        pis_cpf = num
+                        break
                 
-                dia = data_str[0:2]
-                mes = data_str[2:4]
-                ano = data_str[4:8]
-                data_form = f"{ano}-{mes}-{dia}"
-                hora_form = f"{hora_str[0:2]}:{hora_str[2:4]}"
+                # Tenta extrair Data (DDMMAAAA) e Hora (HHMM ou HHMMSS)
+                data_form = "Data Inválida"
+                hora_form = "Hora Inválida"
+                
+                # Padrão AFD Padrão: posições 10-18 = Data (DDMMAAAA), 18-22 = Hora (HHMM)
+                if len(linha) >= 22:
+                    d_str = linha[10:18]
+                    h_str = linha[18:22]
+                    if d_str.isdigit() and len(d_str) == 8:
+                        data_form = f"{d_str[4:8]}-{d_str[2:4]}-{d_str[0:2]}"
+                    if h_str.isdigit() and len(h_str) == 4:
+                        hora_form = f"{h_str[0:2]}:{h_str[2:4]}"
+                
+                # Identifica o nome pelo De-Para ou usa o PIS/CPF
+                nome_exibicao = mapa_nomes.get(pis_cpf, pis_cpf)
                 
                 registros.append({
-                    "Funcionário (PIS/CPF)": pis if pis else "Não Identificado",
+                    "Funcionário": nome_exibicao,
+                    "PIS/CPF": pis_cpf,
                     "Data": data_form,
                     "Hora": hora_form,
                     "Origem": "Relógio (AFD)",
@@ -49,50 +83,66 @@ def processar_txt(uploaded_file):
             except Exception:
                 continue
                 
-        # Padrão Delimitado (CSV/TXT com vírgula, ponto e vírgula ou tabulação)
+        # Padrão Texto Delimitado (CSV/TXT com ;, , ou TAB)
         elif ";" in linha or "," in linha or "\t" in linha:
             separador = ";" if ";" in linha else ("," if "," in linha else "\t")
             partes = [p.strip() for p in linha.split(separador)]
             if len(partes) >= 3:
+                doc = re.sub(r'\D', '', partes[0])
+                nome = mapa_nomes.get(doc, partes[0])
                 registros.append({
-                    "Funcionário (PIS/CPF)": partes[0],
+                    "Funcionário": nome,
+                    "PIS/CPF": doc,
                     "Data": partes[1],
                     "Hora": partes[2],
                     "Origem": "Arquivo TXT",
                     "Observação": partes[3] if len(partes) > 3 else ""
                 })
-                
-    df = pd.DataFrame(registros)
-    return df
 
-# Estado Global
+    return pd.DataFrame(registros)
+
+# --- Inicialização do Estado ---
 if "df_ponto" not in st.session_state:
-    st.session_state.df_ponto = pd.DataFrame(columns=["Funcionário (PIS/CPF)", "Data", "Hora", "Origem", "Observação"])
+    st.session_state.df_ponto = pd.DataFrame(columns=["Funcionário", "PIS/CPF", "Data", "Hora", "Origem", "Observação"])
 
+# --- Interface Sidebar ---
 sidebar = st.sidebar
-sidebar.header("📁 Importar Dados")
-uploaded_file = sidebar.file_uploader("Selecione o arquivo TXT do ponto", type=["txt", "csv", "afd"])
+sidebar.header("📁 Importar Arquivos")
 
-if uploaded_file is not None and st.sidebar.button("Carregar Arquivo"):
-    df_carregado = processar_txt(uploaded_file)
+uploaded_txt = sidebar.file_uploader("1. Arquivo TXT do Relógio de Ponto", type=["txt", "csv", "afd"])
+uploaded_excel = sidebar.file_uploader("2. Planilha de Cadastro (Opcional - Excel/CSV)", type=["xlsx", "xls", "csv"])
+
+df_depara = None
+if uploaded_excel is not None:
+    try:
+        if uploaded_excel.name.endswith('.csv'):
+            df_depara = pd.read_csv(uploaded_excel)
+        else:
+            df_depara = pd.read_excel(uploaded_excel)
+        sidebar.success("Planilha de cadastro carregada!")
+    except Exception as e:
+        sidebar.error("Erro ao ler planilha de cadastro.")
+
+if uploaded_txt is not None and sidebar.button("Carregar Dados do Ponto"):
+    df_carregado = processar_txt(uploaded_txt, df_depara)
     if not df_carregado.empty:
-        st.session_state.df_ponto = pd.concat([st.session_state.df_ponto, df_carregado]).drop_duplicates().reset_index(drop=True)
-        st.sidebar.success(f"{len(df_carregado)} registros carregados!")
+        st.session_state.df_ponto = df_carregado
+        sidebar.success(f"{len(df_carregado)} registros carregados!")
     else:
-        st.sidebar.error("Nenhum registro de ponto reconhecido no arquivo. Verifique a estrutura do TXT.")
+        sidebar.error("Nenhum registro válido encontrado no arquivo TXT.")
 
+# --- Painel de Edição ---
 if not st.session_state.df_ponto.empty:
-    funcionarios = sorted(st.session_state.df_ponto["Funcionário (PIS/CPF)"].unique().tolist())
+    funcionarios = sorted(st.session_state.df_ponto["Funcionário"].unique().tolist())
     func_selecionado = st.selectbox("Selecione o Funcionário:", funcionarios)
     
-    df_func = st.session_state.df_ponto[st.session_state.df_ponto["Funcionário (PIS/CPF)"] == func_selecionado].copy()
+    df_func = st.session_state.df_ponto[st.session_state.df_ponto["Funcionário"] == func_selecionado].copy()
     
-    st.subheader(f"Batidas de Ponto - Funcionário: {func_selecionado}")
+    st.subheader(f"Batidas de Ponto: {func_selecionado}")
     
     tab1, tab2 = st.tabs(["📝 Editar Batidas", "➕ Adicionar Nova Batida"])
     
     with tab1:
-        st.write("Altere ou ajuste os dados na tabela abaixo:")
         edited_df = st.data_editor(
             df_func,
             num_rows="dynamic",
@@ -100,13 +150,12 @@ if not st.session_state.df_ponto.empty:
             key="editor"
         )
         
-        if st.button("Salvar Alterações da Tabela"):
-            st.session_state.df_ponto = st.session_state.df_ponto[st.session_state.df_ponto["Funcionário (PIS/CPF)"] != func_selecionado]
+        if st.button("Salvar Alterações"):
+            st.session_state.df_ponto = st.session_state.df_ponto[st.session_state.df_ponto["Funcionário"] != func_selecionado]
             st.session_state.df_ponto = pd.concat([st.session_state.df_ponto, edited_df]).reset_index(drop=True)
             st.success("Alterações salvas com sucesso!")
 
     with tab2:
-        st.write("Adicionar ajuste manual:")
         col1, col2, col3 = st.columns(3)
         nova_data = col1.date_input("Data", datetime.today())
         nova_hora = col2.time_input("Horário", datetime.now().time())
@@ -114,7 +163,8 @@ if not st.session_state.df_ponto.empty:
         
         if st.button("Adicionar Registro"):
             novo_registro = pd.DataFrame([{
-                "Funcionário (PIS/CPF)": func_selecionado,
+                "Funcionário": func_selecionado,
+                "PIS/CPF": df_func["PIS/CPF"].iloc[0] if not df_func.empty else "",
                 "Data": nova_data.strftime("%Y-%m-%d"),
                 "Hora": nova_hora.strftime("%H:%M"),
                 "Origem": "Manual",
@@ -137,7 +187,7 @@ if not st.session_state.df_ponto.empty:
         mime="text/csv"
     )
     
-    csv_geral = st.session_state.df_ponto.sort_values(by=["Funcionário (PIS/CPF)", "Data", "Hora"]).to_csv(index=False).encode('utf-8')
+    csv_geral = st.session_state.df_ponto.sort_values(by=["Funcionário", "Data", "Hora"]).to_csv(index=False).encode('utf-8')
     col_exp2.download_button(
         label="📥 Baixar Espelho Geral de Todos (CSV)",
         data=csv_geral,
