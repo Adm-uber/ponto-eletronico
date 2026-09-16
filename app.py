@@ -6,56 +6,75 @@ import re
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 st.title("⏱️ Sistema de Fechamento de Ponto")
-st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto (padrão AFD) para processar as batidas.")
+st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto e, opcionalmente, de uma planilha de cadastro para complementar os nomes ausentes.")
 
-# --- Processamento do Arquivo AFD ---
-def processar_arquivo_afd(uploaded_txt):
+# --- Processamento do Arquivo AFD + Cadastro Opcional ---
+def processar_arquivos(uploaded_txt, uploaded_excel=None):
+    mapa_colaboradores = {}
+    
+    # 1. Mapear do Excel/CSV de cadastro (se fornecido)
+    if uploaded_excel is not None:
+        try:
+            df_cad = pd.read_csv(uploaded_excel) if uploaded_excel.name.endswith('.csv') else pd.read_excel(uploaded_excel)
+            col_nome, col_doc = None, None
+            
+            for c in df_cad.columns:
+                c_str = str(c).strip().lower()
+                if any(k in c_str for k in ["nome", "colaborador", "funcionario"]):
+                    col_nome = c
+                elif any(k in c_str for k in ["pis", "cpf", "doc", "id", "matricula", "cod"]):
+                    col_doc = c
+            
+            if col_nome and col_doc:
+                for _, row in df_cad.iterrows():
+                    nome = str(row[col_nome]).strip()
+                    doc_digits = re.sub(r'\D', '', str(row[col_doc]))
+                    if nome and doc_digits:
+                        mapa_colaboradores[doc_digits] = nome
+                        mapa_colaboradores[doc_digits.lstrip('0')] = nome
+                        mapa_colaboradores[doc_digits.zfill(10)] = nome
+                        mapa_colaboradores[doc_digits.zfill(12)] = nome
+        except Exception as e:
+            st.sidebar.warning(f"Aviso ao ler planilha auxiliar: {e}")
+
+    # 2. Mapear colaboradores do próprio TXT (Registro Tipo 5)
     linhas = uploaded_txt.getvalue().decode("utf-8", errors="ignore").splitlines()
     
-    mapa_colaboradores = {}
-    registros = []
-
-    # Passo 1: Mapear colaboradores cadastrados no relógio (Registro Tipo 5)
     for linha in linhas:
         linha = linha.strip()
         if len(linha) >= 37 and linha[9] == '5':
             try:
-                tipo_doc = linha[23:25]
                 num_doc = linha[25:35].strip()
-                doc_completo = f"{tipo_doc}{num_doc}"
-                
-                # O nome do funcionário fica posicionado a partir da coluna 35
                 nome_raw = linha[35:87] if len(linha) >= 87 else linha[35:]
                 match_nome = re.search(r'^[A-Za-zÀ-ÿ\s]+', nome_raw)
                 nome = match_nome.group(0).strip() if match_nome else nome_raw.strip()
                 
-                if nome:
-                    mapa_colaboradores[doc_completo] = nome
+                if nome and num_doc:
                     mapa_colaboradores[num_doc] = nome
                     mapa_colaboradores[num_doc.lstrip('0')] = nome
             except Exception:
                 continue
 
-    # Passo 2: Mapear batidas de ponto (Registro Tipo 3)
+    # 3. Mapear batidas de ponto (Registro Tipo 3)
+    registros = []
     for linha in linhas:
         linha = linha.strip()
         if len(linha) >= 34 and linha[9] == '3':
             try:
                 data_raw = linha[10:18]   # DDMMAAAA
                 hora_raw = linha[18:22]   # HHMM
-                doc_completo = linha[22:34] # Documento/PIS de 12 dígitos
+                doc_completo = linha[22:34] # 12 dígitos (TipoDoc + Documento)
                 num_doc = linha[24:34]      # 10 dígitos do documento
                 
-                # Formatadores de Data e Hora
                 data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}"
                 hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}"
                 
-                # Busca o nome correspondente no cadastro mapeado no Passo 1
+                # Busca nome no mapa ou exibe o ID
                 nome = mapa_colaboradores.get(
-                    doc_completo, 
+                    num_doc, 
                     mapa_colaboradores.get(
-                        num_doc, 
-                        mapa_colaboradores.get(num_doc.lstrip('0'), f"PIS/ID: {doc_completo}")
+                        num_doc.lstrip('0'), 
+                        mapa_colaboradores.get(doc_completo, f"PIS/ID: {doc_completo}")
                     )
                 )
                 
@@ -78,10 +97,11 @@ if "df_ponto" not in st.session_state:
 
 # --- Sidebar ---
 st.sidebar.header("📁 Importar Dados")
-uploaded_txt = st.sidebar.file_uploader("Arquivo TXT do Relógio (.txt / .afd)", type=["txt", "csv", "afd"])
+uploaded_txt = st.sidebar.file_uploader("1. Arquivo TXT do Relógio (.txt / .afd)", type=["txt", "csv", "afd"])
+uploaded_excel = st.sidebar.file_uploader("2. Cadastro Auxiliar (Opcional .xlsx / .csv)", type=["xlsx", "xls", "csv"])
 
 if uploaded_txt is not None and st.sidebar.button("Processar e Fechar Ponto"):
-    df_res = processar_arquivo_afd(uploaded_txt)
+    df_res = processar_arquivos(uploaded_txt, uploaded_excel)
     if not df_res.empty:
         st.session_state.df_ponto = df_res
         st.sidebar.success(f"Sucesso! {len(df_res)} registros processados.")
