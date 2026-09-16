@@ -2,66 +2,66 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import re
-import base64
 
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 st.title("⏱️ Sistema de Fechamento de Ponto")
-st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto para processar as batidas.")
+st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto (padrão AFD) para processar as batidas.")
 
-# --- Função de Decodificação ---
-def decodificar_id(valor):
-    """
-    Tenta decodificar identificadores codificados em Base64 ou limpa caracteres.
-    """
-    if not valor or not isinstance(valor, str):
-        return ""
-    
-    valor_clean = valor.strip()
-    
-    # Tentativa de decodificação Base64 se parecer um hash
-    if len(valor_clean) % 4 == 0 and re.match(r'^[A-Za-z0-9+/=]+$', valor_clean) and not valor_clean.isdigit():
-        try:
-            dec = base64.b64decode(valor_clean).decode('utf-8', errors='ignore').strip()
-            if dec:
-                return dec
-        except Exception:
-            pass
-
-    return valor_clean
-
-# --- Processamento ---
-def processar_arquivo_txt(uploaded_txt):
+# --- Processamento do Arquivo AFD ---
+def processar_arquivo_afd(uploaded_txt):
     linhas = uploaded_txt.getvalue().decode("utf-8", errors="ignore").splitlines()
+    
+    mapa_colaboradores = {}
     registros = []
 
+    # Passo 1: Mapear colaboradores cadastrados no relógio (Registro Tipo 5)
     for linha in linhas:
         linha = linha.strip()
-        if not linha:
-            continue
-            
-        # Padrão AFD (Registro Tipo 3 = Marcação de Ponto)
-        if len(linha) >= 30 and (linha[9:10] == "3" or "3" in linha[9:11]):
+        if len(linha) >= 37 and linha[9] == '5':
+            try:
+                tipo_doc = linha[23:25]
+                num_doc = linha[25:35].strip()
+                doc_completo = f"{tipo_doc}{num_doc}"
+                
+                # O nome do funcionário fica posicionado a partir da coluna 35
+                nome_raw = linha[35:87] if len(linha) >= 87 else linha[35:]
+                match_nome = re.search(r'^[A-Za-zÀ-ÿ\s]+', nome_raw)
+                nome = match_nome.group(0).strip() if match_nome else nome_raw.strip()
+                
+                if nome:
+                    mapa_colaboradores[doc_completo] = nome
+                    mapa_colaboradores[num_doc] = nome
+                    mapa_colaboradores[num_doc.lstrip('0')] = nome
+            except Exception:
+                continue
+
+    # Passo 2: Mapear batidas de ponto (Registro Tipo 3)
+    for linha in linhas:
+        linha = linha.strip()
+        if len(linha) >= 34 and linha[9] == '3':
             try:
                 data_raw = linha[10:18]   # DDMMAAAA
                 hora_raw = linha[18:22]   # HHMM
-                doc_raw = linha[22:].strip() # PIS / CPF / Crachá / ID
+                doc_completo = linha[22:34] # Documento/PIS de 12 dígitos
+                num_doc = linha[24:34]      # 10 dígitos do documento
                 
-                # Decodifica caso venha codificado em Base64 ou extrai dígitos
-                doc_decodificado = decodificar_id(doc_raw)
-                numeros_doc = re.findall(r'\d+', doc_decodificado)
-                doc_limpo = numeros_doc[0] if numeros_doc else doc_decodificado
+                # Formatadores de Data e Hora
+                data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}"
+                hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}"
                 
-                # Trata Data e Hora
-                data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}" if len(data_raw) == 8 and data_raw.isdigit() else "Data Invalida"
-                hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}" if len(hora_raw) == 4 and hora_raw.isdigit() else "Hora Invalida"
+                # Busca o nome correspondente no cadastro mapeado no Passo 1
+                nome = mapa_colaboradores.get(
+                    doc_completo, 
+                    mapa_colaboradores.get(
+                        num_doc, 
+                        mapa_colaboradores.get(num_doc.lstrip('0'), f"PIS/ID: {doc_completo}")
+                    )
+                )
                 
-                # Identificador obtido diretamente do arquivo
-                colaborador_id = f"Colaborador {doc_limpo}" if doc_limpo else "Desconhecido"
-
                 registros.append({
-                    "Colaborador": colaborador_id,
-                    "PIS/CPF/ID": doc_limpo,
+                    "Colaborador": nome,
+                    "PIS/CPF/ID": doc_completo,
                     "Data": data_form,
                     "Hora": hora_form,
                     "Origem": "Relógio (AFD)",
@@ -78,15 +78,15 @@ if "df_ponto" not in st.session_state:
 
 # --- Sidebar ---
 st.sidebar.header("📁 Importar Dados")
-uploaded_txt = st.sidebar.file_uploader("Arquivo TXT do Relógio (.txt)", type=["txt", "csv", "afd"])
+uploaded_txt = st.sidebar.file_uploader("Arquivo TXT do Relógio (.txt / .afd)", type=["txt", "csv", "afd"])
 
 if uploaded_txt is not None and st.sidebar.button("Processar e Fechar Ponto"):
-    df_res = processar_arquivo_txt(uploaded_txt)
+    df_res = processar_arquivo_afd(uploaded_txt)
     if not df_res.empty:
         st.session_state.df_ponto = df_res
         st.sidebar.success(f"Sucesso! {len(df_res)} registros processados.")
     else:
-        st.sidebar.error("Não foi possível identificar registros de ponto válidos no arquivo TXT.")
+        st.sidebar.error("Não foi possível identificar registros de ponto válidos no arquivo enviado.")
 
 # --- Área Principal ---
 if not st.session_state.df_ponto.empty:
