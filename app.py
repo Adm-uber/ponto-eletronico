@@ -2,44 +2,37 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import re
+import json
+import os
 
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
-st.title("⏱️ Sistema de Fechamento de Ponto")
-st.markdown("Faça o upload do arquivo `.txt` do relógio de ponto e, opcionalmente, de uma planilha de cadastro para complementar os nomes ausentes.")
+ARQUIVO_MEMORIA = "mapa_colaboradores.json"
 
-# --- Processamento do Arquivo AFD + Cadastro Opcional ---
-def processar_arquivos(uploaded_txt, uploaded_excel=None):
-    mapa_colaboradores = {}
-    
-    # 1. Mapear do Excel/CSV de cadastro (se fornecido)
-    if uploaded_excel is not None:
+# --- Funções para Mapeamento em Memória (JSON) ---
+def carregar_memoria():
+    if os.path.exists(ARQUIVO_MEMORIA):
         try:
-            df_cad = pd.read_csv(uploaded_excel) if uploaded_excel.name.endswith('.csv') else pd.read_excel(uploaded_excel)
-            col_nome, col_doc = None, None
-            
-            for c in df_cad.columns:
-                c_str = str(c).strip().lower()
-                if any(k in c_str for k in ["nome", "colaborador", "funcionario"]):
-                    col_nome = c
-                elif any(k in c_str for k in ["pis", "cpf", "doc", "id", "matricula", "cod"]):
-                    col_doc = c
-            
-            if col_nome and col_doc:
-                for _, row in df_cad.iterrows():
-                    nome = str(row[col_nome]).strip()
-                    doc_digits = re.sub(r'\D', '', str(row[col_doc]))
-                    if nome and doc_digits:
-                        mapa_colaboradores[doc_digits] = nome
-                        mapa_colaboradores[doc_digits.lstrip('0')] = nome
-                        mapa_colaboradores[doc_digits.zfill(10)] = nome
-                        mapa_colaboradores[doc_digits.zfill(12)] = nome
-        except Exception as e:
-            st.sidebar.warning(f"Aviso ao ler planilha auxiliar: {e}")
+            with open(ARQUIVO_MEMORIA, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-    # 2. Mapear colaboradores do próprio TXT (Registro Tipo 5)
+def salvar_memoria(mapa):
+    try:
+        with open(ARQUIVO_MEMORIA, "w", encoding="utf-8") as f:
+            json.dump(mapa, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        st.error(f"Erro ao salvar mapa em disco: {e}")
+
+# --- Processamento do Arquivo AFD ---
+def processar_arquivos(uploaded_txt, mapa_salvo):
+    mapa_colaboradores = dict(mapa_salvo)
+    
     linhas = uploaded_txt.getvalue().decode("utf-8", errors="ignore").splitlines()
     
+    # 1. Mapear colaboradores do próprio TXT (Registro Tipo 5)
     for linha in linhas:
         linha = linha.strip()
         if len(linha) >= 37 and linha[9] == '5':
@@ -55,7 +48,7 @@ def processar_arquivos(uploaded_txt, uploaded_excel=None):
             except Exception:
                 continue
 
-    # 3. Mapear batidas de ponto (Registro Tipo 3)
+    # 2. Mapear batidas de ponto (Registro Tipo 3)
     registros = []
     for linha in linhas:
         linha = linha.strip()
@@ -63,13 +56,13 @@ def processar_arquivos(uploaded_txt, uploaded_excel=None):
             try:
                 data_raw = linha[10:18]   # DDMMAAAA
                 hora_raw = linha[18:22]   # HHMM
-                doc_completo = linha[22:34] # 12 dígitos (TipoDoc + Documento)
-                num_doc = linha[24:34]      # 10 dígitos do documento
+                doc_completo = linha[22:34] # 12 dígitos
+                num_doc = linha[24:34]      # 10 dígitos
                 
                 data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}"
                 hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}"
                 
-                # Busca nome no mapa ou exibe o ID
+                # Busca nome no mapa ou mantém tag de não identificado
                 nome = mapa_colaboradores.get(
                     num_doc, 
                     mapa_colaboradores.get(
@@ -91,24 +84,68 @@ def processar_arquivos(uploaded_txt, uploaded_excel=None):
 
     return pd.DataFrame(registros)
 
-# --- Session State ---
+# --- Inicialização da Memória ---
+if "mapa_memoria" not in st.session_state:
+    st.session_state.mapa_memoria = carregar_memoria()
+
 if "df_ponto" not in st.session_state:
     st.session_state.df_ponto = pd.DataFrame(columns=["Colaborador", "PIS/CPF/ID", "Data", "Hora", "Origem", "Observação"])
 
 # --- Sidebar ---
 st.sidebar.header("📁 Importar Dados")
-uploaded_txt = st.sidebar.file_uploader("1. Arquivo TXT do Relógio (.txt / .afd)", type=["txt", "csv", "afd"])
-uploaded_excel = st.sidebar.file_uploader("2. Cadastro Auxiliar (Opcional .xlsx / .csv)", type=["xlsx", "xls", "csv"])
+uploaded_txt = st.sidebar.file_uploader("Arquivo TXT do Relógio (.txt / .afd)", type=["txt", "csv", "afd"])
 
 if uploaded_txt is not None and st.sidebar.button("Processar e Fechar Ponto"):
-    df_res = processar_arquivos(uploaded_txt, uploaded_excel)
+    df_res = processar_arquivos(uploaded_txt, st.session_state.mapa_memoria)
     if not df_res.empty:
         st.session_state.df_ponto = df_res
         st.sidebar.success(f"Sucesso! {len(df_res)} registros processados.")
     else:
-        st.sidebar.error("Não foi possível identificar registros de ponto válidos no arquivo enviado.")
+        st.sidebar.error("Não foi possível identificar registros de ponto válidos.")
+
+# --- Bloco de Gerenciamento "De-Para" de Nomes ---
+with st.sidebar.expander("👤 Cadastrar/Vincular Nome ao PIS"):
+    st.write("Vincule um PIS/ID ao Nome do Colaborador para salvar permanentemente:")
+    
+    # Identifica IDs sem nome atribuído
+    ids_desconhecidos = []
+    if not st.session_state.df_ponto.empty:
+        df_unkn = st.session_state.df_ponto[st.session_state.df_ponto["Colaborador"].str.startswith("PIS/ID:", na=False)]
+        ids_desconhecidos = sorted(df_unkn["PIS/CPF/ID"].unique().tolist())
+
+    if ids_desconhecidos:
+        id_selecionado = st.selectbox("Selecione um PIS sem Nome:", ids_desconhecidos)
+    else:
+        id_selecionado = st.text_input("Digite o PIS/ID (12 dígitos):")
+
+    novo_nome = st.text_input("Nome do Colaborador:")
+
+    if st.button("Salvar Vinculação"):
+        if id_selecionado and novo_nome:
+            doc_limpo = re.sub(r'\D', '', id_selecionado)
+            num_10 = doc_limpo[2:] if len(doc_limpo) == 12 else doc_limpo
+            
+            # Atualiza memória e salva no JSON
+            st.session_state.mapa_memoria[doc_limpo] = novo_nome.strip()
+            st.session_state.mapa_memoria[num_10] = novo_nome.strip()
+            st.session_state.mapa_memoria[num_10.lstrip('0')] = novo_nome.strip()
+            
+            salvar_memoria(st.session_state.mapa_memoria)
+            
+            # Atualiza na tabela atual se já estiver aberta
+            if not st.session_state.df_ponto.empty:
+                st.session_state.df_ponto.loc[
+                    st.session_state.df_ponto["PIS/CPF/ID"] == id_selecionado, "Colaborador"
+                ] = novo_nome.strip()
+            
+            st.success(f"Vinculado: {id_selecionado} ➔ {novo_nome}")
+            st.rerun()
+        else:
+            st.warning("Preencha o ID e o Nome.")
 
 # --- Área Principal ---
+st.title("⏱️ Fechamento de Ponto Eletrônico")
+
 if not st.session_state.df_ponto.empty:
     colaboradores = sorted(st.session_state.df_ponto["Colaborador"].unique().tolist())
     colab_sel = st.selectbox("Selecione o Colaborador:", colaboradores)
