@@ -8,8 +8,24 @@ import os
 st.set_page_config(page_title="Gestão e Fechamento de Ponto", layout="wide")
 
 ARQUIVO_MEMORIA = "mapa_colaboradores.json"
+CARGA_DIARIA_MINUTOS = 520  # 8h 40min = 520 minutos
 
-# --- Funções para Mapeamento em Memória (JSON) ---
+# --- Funções Auxiliares de Horas ---
+def hhmm_para_minutos(horastr):
+    try:
+        h, m = map(int, horastr.split(':'))
+        return h * 60 + m
+    except Exception:
+        return 0
+
+def minutos_para_hhmm(minutos):
+    sinal = "-" if minutos < 0 else ""
+    m = abs(int(minutos))
+    horas = m // 60
+    mins = m % 60
+    return f"{sinal}{horas:02d}:{mins:02d}"
+
+# --- Mapeamento em Memória (JSON) ---
 def carregar_memoria():
     if os.path.exists(ARQUIVO_MEMORIA):
         try:
@@ -29,10 +45,9 @@ def salvar_memoria(mapa):
 # --- Processamento do Arquivo AFD ---
 def processar_arquivos(uploaded_txt, mapa_salvo):
     mapa_colaboradores = dict(mapa_salvo)
-    
     linhas = uploaded_txt.getvalue().decode("utf-8", errors="ignore").splitlines()
     
-    # 1. Mapear colaboradores do próprio TXT (Registro Tipo 5)
+    # Mapear colaboradores do Registro Tipo 5 (se houver)
     for linha in linhas:
         linha = linha.strip()
         if len(linha) >= 37 and linha[9] == '5':
@@ -43,12 +58,14 @@ def processar_arquivos(uploaded_txt, mapa_salvo):
                 nome = match_nome.group(0).strip() if match_nome else nome_raw.strip()
                 
                 if nome and num_doc:
-                    mapa_colaboradores[num_doc] = nome
-                    mapa_colaboradores[num_doc.lstrip('0')] = nome
+                    if num_doc not in mapa_colaboradores:
+                        mapa_colaboradores[num_doc] = {"nome": nome, "jornada": "07:00 às 16:40"}
+                    if num_doc.lstrip('0') not in mapa_colaboradores:
+                        mapa_colaboradores[num_doc.lstrip('0')] = {"nome": nome, "jornada": "07:00 às 16:40"}
             except Exception:
                 continue
 
-    # 2. Mapear batidas de ponto (Registro Tipo 3)
+    # Mapear batidas do Registro Tipo 3
     registros = []
     for linha in linhas:
         linha = linha.strip()
@@ -62,18 +79,22 @@ def processar_arquivos(uploaded_txt, mapa_salvo):
                 data_form = f"{data_raw[4:8]}-{data_raw[2:4]}-{data_raw[0:2]}"
                 hora_form = f"{hora_raw[0:2]}:{hora_raw[2:4]}"
                 
-                # Busca nome no mapa ou mantém tag de não identificado
-                nome = mapa_colaboradores.get(
-                    num_doc, 
-                    mapa_colaboradores.get(
-                        num_doc.lstrip('0'), 
-                        mapa_colaboradores.get(doc_completo, f"PIS/ID: {doc_completo}")
-                    )
-                )
+                info = mapa_colaboradores.get(num_doc) or mapa_colaboradores.get(num_doc.lstrip('0')) or mapa_colaboradores.get(doc_completo)
+                
+                if isinstance(info, dict):
+                    nome = info.get("nome", f"PIS/ID: {doc_completo}")
+                    jornada = info.get("jornada", "07:00 às 16:40")
+                elif isinstance(info, str):
+                    nome = info
+                    jornada = "07:00 às 16:40"
+                else:
+                    nome = f"PIS/ID: {doc_completo}"
+                    jornada = "07:00 às 16:40"
                 
                 registros.append({
                     "Colaborador": nome,
                     "PIS/CPF/ID": doc_completo,
+                    "Jornada": jornada,
                     "Data": data_form,
                     "Hora": hora_form,
                     "Origem": "Relógio (AFD)",
@@ -84,12 +105,59 @@ def processar_arquivos(uploaded_txt, mapa_salvo):
 
     return pd.DataFrame(registros)
 
+# --- Cálculo de Horas Extras e Atrasos ---
+def calcular_horas_diarias(df_colab):
+    if df_colab.empty:
+        return pd.DataFrame()
+    
+    resumo_dias = []
+    
+    for (data, colab), group in df_colab.groupby(["Data", "Colaborador"]):
+        horas = sorted(group["Hora"].tolist())
+        minutos_batidas = [hhmm_para_minutos(h) for h in horas]
+        
+        jornada = group["Jornada"].iloc[0] if "Jornada" in group.columns else "07:00 às 16:40"
+        
+        tempo_trabalhado_min = 0
+        
+        # Cálculo dependendo da quantidade de batidas
+        if len(minutos_batidas) >= 4:
+            # Entrada 1 -> Saída 1 + Entrada 2 -> Saída 2
+            tempo_trabalhado_min = (minutos_batidas[1] - minutos_batidas[0]) + (minutos_batidas[3] - minutos_batidas[2])
+        elif len(minutos_batidas) == 2:
+            # Entrada 1 -> Saída 2 (deduz 1h de almoço = 60min)
+            tempo_trabalhado_min = (minutos_batidas[1] - minutos_batidas[0]) - 60
+            if tempo_trabalhado_min < 0:
+                tempo_trabalhado_min = 0
+        elif len(minutos_batidas) == 3:
+            tempo_trabalhado_min = (minutos_batidas[1] - minutos_batidas[0]) + (minutos_batidas[2] - minutos_batidas[1])
+        
+        saldo_min = tempo_trabalhado_min - CARGA_DIARIA_MINUTOS
+        horas_extras_min = max(0, saldo_min)
+        atraso_min = max(0, -saldo_min) if tempo_trabalhado_min < CARGA_DIARIA_MINUTOS else 0
+        
+        resumo_dias.append({
+            "Data": data,
+            "Colaborador": colab,
+            "Jornada": jornada,
+            "Batidas": ", ".join(horas),
+            "Qtd Batidas": len(horas),
+            "Trabalhado": minutos_para_hhmm(tempo_trabalhado_min),
+            "Meta": "08:40",
+            "Hora Extra": minutos_para_hhmm(horas_extras_min),
+            "Atraso/Falta": minutos_para_hhmm(atraso_min),
+            "Saldo Minutos": saldo_min,
+            "Saldo": minutos_para_hhmm(saldo_min)
+        })
+        
+    return pd.DataFrame(resumo_dias)
+
 # --- Inicialização da Memória ---
 if "mapa_memoria" not in st.session_state:
     st.session_state.mapa_memoria = carregar_memoria()
 
 if "df_ponto" not in st.session_state:
-    st.session_state.df_ponto = pd.DataFrame(columns=["Colaborador", "PIS/CPF/ID", "Data", "Hora", "Origem", "Observação"])
+    st.session_state.df_ponto = pd.DataFrame(columns=["Colaborador", "PIS/CPF/ID", "Jornada", "Data", "Hora", "Origem", "Observação"])
 
 # --- Sidebar ---
 st.sidebar.header("📁 Importar Dados")
@@ -103,11 +171,10 @@ if uploaded_txt is not None and st.sidebar.button("Processar e Fechar Ponto"):
     else:
         st.sidebar.error("Não foi possível identificar registros de ponto válidos.")
 
-# --- Bloco de Gerenciamento "De-Para" de Nomes ---
-with st.sidebar.expander("👤 Cadastrar/Vincular Nome ao PIS"):
-    st.write("Vincule um PIS/ID ao Nome do Colaborador para salvar permanentemente:")
+# --- Bloco de Gerenciamento "De-Para" e Jornada ---
+with st.sidebar.expander("👤 Cadastrar / Alterar Jornada"):
+    st.write("Vincule o PIS ao Nome e selecione a Jornada de Trabalho:")
     
-    # Identifica IDs sem nome atribuído
     ids_desconhecidos = []
     if not st.session_state.df_ponto.empty:
         df_unkn = st.session_state.df_ponto[st.session_state.df_ponto["Colaborador"].str.startswith("PIS/ID:", na=False)]
@@ -119,26 +186,30 @@ with st.sidebar.expander("👤 Cadastrar/Vincular Nome ao PIS"):
         id_selecionado = st.text_input("Digite o PIS/ID (12 dígitos):")
 
     novo_nome = st.text_input("Nome do Colaborador:")
+    jornada_sel = st.selectbox("Jornada de Trabalho:", ["07:00 às 16:40", "08:00 às 17:40"])
 
     if st.button("Salvar Vinculação"):
         if id_selecionado and novo_nome:
             doc_limpo = re.sub(r'\D', '', id_selecionado)
             num_10 = doc_limpo[2:] if len(doc_limpo) == 12 else doc_limpo
             
-            # Atualiza memória e salva no JSON
-            st.session_state.mapa_memoria[doc_limpo] = novo_nome.strip()
-            st.session_state.mapa_memoria[num_10] = novo_nome.strip()
-            st.session_state.mapa_memoria[num_10.lstrip('0')] = novo_nome.strip()
+            dado = {"nome": novo_nome.strip(), "jornada": jornada_sel}
+            
+            st.session_state.mapa_memoria[doc_limpo] = dado
+            st.session_state.mapa_memoria[num_10] = dado
+            st.session_state.mapa_memoria[num_10.lstrip('0')] = dado
             
             salvar_memoria(st.session_state.mapa_memoria)
             
-            # Atualiza na tabela atual se já estiver aberta
             if not st.session_state.df_ponto.empty:
                 st.session_state.df_ponto.loc[
                     st.session_state.df_ponto["PIS/CPF/ID"] == id_selecionado, "Colaborador"
                 ] = novo_nome.strip()
+                st.session_state.df_ponto.loc[
+                    st.session_state.df_ponto["PIS/CPF/ID"] == id_selecionado, "Jornada"
+                ] = jornada_sel
             
-            st.success(f"Vinculado: {id_selecionado} ➔ {novo_nome}")
+            st.success(f"Salvo: {novo_nome} ({jornada_sel})")
             st.rerun()
         else:
             st.warning("Preencha o ID e o Nome.")
@@ -154,7 +225,7 @@ if not st.session_state.df_ponto.empty:
     
     st.subheader(f"Batidas de Ponto - {colab_sel}")
     
-    tab1, tab2 = st.tabs(["📝 Editar Batidas", "➕ Adicionar Nova Batida"])
+    tab1, tab2, tab3 = st.tabs(["📝 Editar Batidas", "➕ Adicionar Nova Batida", "📊 Carga Horária & Extras"])
     
     with tab1:
         edited_df = st.data_editor(
@@ -177,9 +248,11 @@ if not st.session_state.df_ponto.empty:
         
         if st.button("Adicionar Registro"):
             pis_val = df_colab["PIS/CPF/ID"].iloc[0] if not df_colab.empty else ""
+            jornada_val = df_colab["Jornada"].iloc[0] if not df_colab.empty else "07:00 às 16:40"
             novo_reg = pd.DataFrame([{
                 "Colaborador": colab_sel,
                 "PIS/CPF/ID": pis_val,
+                "Jornada": jornada_val,
                 "Data": nova_data.strftime("%Y-%m-%d"),
                 "Hora": nova_hora.strftime("%H:%M"),
                 "Origem": "Manual",
@@ -188,6 +261,28 @@ if not st.session_state.df_ponto.empty:
             st.session_state.df_ponto = pd.concat([st.session_state.df_ponto, novo_reg]).reset_index(drop=True)
             st.success("Registro adicionado com sucesso!")
             st.rerun()
+
+    with tab3:
+        st.write("Calculado com base na meta diária de **08:40**.")
+        df_calculado = calcular_horas_diarias(df_colab)
+        
+        if not df_calculado.empty:
+            # Métricas em destaque
+            total_saldo_min = df_calculado["Saldo Minutos"].sum()
+            total_extras_min = df_calculado["Saldo Minutos"].apply(lambda x: max(0, x)).sum()
+            total_atrasos_min = df_calculado["Saldo Minutos"].apply(lambda x: max(0, -x)).sum()
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Horas Extras", minutos_para_hhmm(total_extras_min))
+            m2.metric("Total Atrasos/Faltas", minutos_para_hhmm(total_atrasos_min))
+            m3.metric("Saldo Acumulado", minutos_para_hhmm(total_saldo_min))
+            
+            st.dataframe(
+                df_calculado[["Data", "Jornada", "Batidas", "Qtd Batidas", "Trabalhado", "Meta", "Hora Extra", "Atraso/Falta", "Saldo"]],
+                use_container_width=True
+            )
+        else:
+            st.info("Nenhuma batida encontrada para calcular.")
 
     st.divider()
     st.subheader("📊 Exportar Relatório de Ponto")
